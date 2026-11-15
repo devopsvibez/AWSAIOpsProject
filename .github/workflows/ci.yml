@@ -65,7 +65,23 @@ jobs:
       - name: Frontend production build
         working-directory: projects/telugu-pickles/frontend
         run: npm ci --no-audit --no-fund && npm run build
+        
+      - name: Inspect OIDC claims
+        run: |
+          RESPONSE=$(curl -sS \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
 
+          TOKEN=$(echo "$RESPONSE" | jq -r '.value')
+
+          TOKEN="$TOKEN" node -e '
+            const claims = JSON.parse(
+              Buffer.from(process.env.TOKEN.split(".")[1], "base64url").toString()
+            );
+            console.log("Issuer:", claims.iss);
+            console.log("Audience:", JSON.stringify(claims.aud));
+            console.log("Subject:", claims.sub);
+          '
   aws:
     name: AWS access check
     runs-on: ubuntu-latest
@@ -127,14 +143,35 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
+      - name: Cache Trivy vulnerability database
+        uses: actions/cache@v4
+        with:
+            path: ~/.cache/trivy
+            key: trivy-db-${{ runner.os }}
+  
       - name: Trivy image scan (fail on fixable CRITICAL)
         run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image "$LOCAL_IMAGE" \
-            --db-repository "$TRIVY_DB" --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
-            --exit-code 0 --no-progress
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image "$LOCAL_IMAGE" \
-            --db-repository "$TRIVY_DB" --scanners vuln --severity CRITICAL --ignore-unfixed \
-            --exit-code 1 --quiet
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v ~/.cache/trivy:/root/.cache/trivy \
+              "$TRIVY_IMAGE" image "$LOCAL_IMAGE" \
+              --db-repository "$TRIVY_DB" \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 0 \
+              --no-progress
+  
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v ~/.cache/trivy:/root/.cache/trivy \
+              "$TRIVY_IMAGE" image "$LOCAL_IMAGE" \
+              --db-repository "$TRIVY_DB" \
+              --scanners vuln \
+              --severity CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              --quiet
 
       - name: Configure AWS credentials
         if: env.RELEASE == 'true' && needs.aws.outputs.enabled == 'true'
