@@ -67,6 +67,9 @@ jobs:
         run: npm ci --no-audit --no-fund && npm run build
         
       - name: Inspect OIDC claims
+        uses: github/actions-oidc-debugger@main
+        with:
+          audience: sts.amazonaws.com
         run: |
           RESPONSE=$(curl -sS \
             -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
