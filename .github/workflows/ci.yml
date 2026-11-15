@@ -130,6 +130,9 @@ jobs:
           echo "Authenticated to AWS account: ${account_id}"
 
   build:
+    permissions:
+     contents: read
+     id-token: write
     name: Build, scan and push (${{ matrix.service }})
     needs: [security, test, aws]
     # Keep build and scan running even if AWS authentication fails.
@@ -228,6 +231,9 @@ jobs:
           echo "Pushed ${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
+    permissions:
+        contents: write
+        id-token: write
     name: Update GitOps manifests
     needs: [aws, build]
     if: >-
