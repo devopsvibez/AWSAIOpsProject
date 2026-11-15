@@ -1,0 +1,316 @@
+name: App CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "projects/telugu-pickles/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "projects/telugu-pickles/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  IMAGE_TAG: ${{ github.sha }}
+  TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  TRIVY_DB: ghcr.io/aquasecurity/trivy-db:2
+  RELEASE: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+
+jobs:
+  security:
+    name: Security scan
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+      security-events: write
+
+  test:
+    name: Unit tests + frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            projects/telugu-pickles/services/package-lock.json
+            projects/telugu-pickles/frontend/package-lock.json
+
+      - name: Backend unit tests
+        working-directory: projects/telugu-pickles/services
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+      - name: Frontend production build
+        working-directory: projects/telugu-pickles/frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+  aws:
+    name: AWS OIDC access check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+      registry: ${{ steps.registry.outputs.registry }}
+    steps:
+      - name: Check whether this run can release
+        id: check
+        env:
+          ROLE: ${{ secrets.AWS_ROLE_ARN }}
+        shell: bash
+        run: |
+          if [[ "$RELEASE" == "true" && -n "$ROLE" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "AWS release is disabled. Tests, builds and scans will still run."
+          fi
+
+      # Temporary diagnostic. Remove after the IAM trust policy is corrected.
+      - name: Inspect GitHub OIDC claims
+        if: steps.check.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?OIDC request URL unavailable}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?OIDC request token unavailable}"
+
+          response="$(curl --fail --silent --show-error --retry 2 \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")"
+          token="$(jq -er '.value' <<< "$response")"
+
+          TOKEN="$token" node <<'NODE'
+          const parts = process.env.TOKEN.split(".");
+          if (parts.length !== 3) throw new Error("Invalid OIDC token");
+          const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+          console.log("Issuer:", claims.iss);
+          console.log("Audience:", JSON.stringify(claims.aud));
+          console.log("Subject:", claims.sub);
+          NODE
+
+      - name: Configure AWS credentials through OIDC
+        id: configure
+        if: steps.check.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Verify AWS identity
+        id: registry
+        if: steps.configure.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          echo "registry=${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_OUTPUT"
+          echo "Authenticated to AWS account: ${account_id}"
+
+  build:
+    name: Build, scan and push (${{ matrix.service }})
+    needs: [security, test, aws]
+    # Keep build and scan running even if AWS authentication fails.
+    if: >-
+      always() &&
+      needs.security.result == 'success' &&
+      needs.test.result == 'success' &&
+      (needs.aws.result == 'success' || needs.aws.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [frontend, gateway, auth-service, catalog-service, cart-service, order-service, payment-service]
+    env:
+      LOCAL_IMAGE: telugu-pickles/${{ matrix.service }}:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service == 'frontend' && 'projects/telugu-pickles/frontend' || 'projects/telugu-pickles/services' }}
+          build-args: SERVICE=${{ matrix.service }}
+          platforms: linux/amd64
+          pull: true
+          load: true
+          tags: ${{ env.LOCAL_IMAGE }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Cache Trivy database
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-${{ matrix.service }}-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-${{ matrix.service }}-
+
+      - name: Scan image with Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/trivy"
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image "$LOCAL_IMAGE" \
+            --db-repository "$TRIVY_DB" \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0 \
+            --no-progress
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image "$LOCAL_IMAGE" \
+            --db-repository "$TRIVY_DB" \
+            --scanners vuln \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --skip-db-update \
+            --exit-code 1 \
+            --quiet
+
+      - name: Configure AWS credentials through OIDC
+        if: env.RELEASE == 'true' && needs.aws.result == 'success' && needs.aws.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ECRPush-${{ matrix.service }}-${{ github.run_id }}
+
+      - name: Push image to ECR
+        if: env.RELEASE == 'true' && needs.aws.result == 'success' && needs.aws.outputs.enabled == 'true'
+        env:
+          REGISTRY: ${{ needs.aws.outputs.registry }}
+          REPOSITORY: telugu-pickles/${{ matrix.service }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! aws ecr describe-repositories --repository-names "$REPOSITORY" >/dev/null 2>&1; then
+            echo "::error title=ECR repository missing::${REPOSITORY} does not exist. Run the Infrastructure workflow first."
+            exit 1
+          fi
+
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$REGISTRY"
+          docker tag "$LOCAL_IMAGE" "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+          echo "Pushed ${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Update GitOps manifests
+    needs: [aws, build]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request' &&
+      needs.aws.result == 'success' &&
+      needs.aws.outputs.enabled == 'true' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      REGISTRY: ${{ needs.aws.outputs.registry }}
+      SERVICES: frontend gateway auth-service catalog-service cart-service order-service payment-service
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitOpsUpdate-${{ github.run_id }}
+
+      - name: Verify all seven images exist in ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          for service in $SERVICES; do
+            aws ecr describe-images \
+              --repository-name "telugu-pickles/${service}" \
+              --image-ids "imageTag=${IMAGE_TAG}" >/dev/null
+          done
+
+      - name: Install mikefarah yq
+        shell: bash
+        run: |
+          set -euo pipefail
+          YQ_VERSION="v4.44.3"
+          sudo curl --fail --silent --show-error --location \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            --output /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Update GitOps image tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f gitops/kustomization.yml
+          for service in $SERVICES; do
+            yq -i \
+              "(.images[] | select(.name == \"telugu-pickles/${service}\")) |= (.newName = \"${REGISTRY}/telugu-pickles/${service}\" | .newTag = \"${IMAGE_TAG}\")" \
+              gitops/kustomization.yml
+          done
+          git diff --check
+          git diff -- gitops/kustomization.yml
+
+      - name: Commit and push GitOps update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gitops/kustomization.yml
+
+          if git diff --cached --quiet; then
+            echo "GitOps image tags are already up to date."
+            exit 0
+          fi
+
+          git commit -m "deploy: telugu-pickles ${IMAGE_TAG:0:7}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+          {
+            echo "### GitOps manifests updated"
+            echo ""
+            echo "Image tag: \`${IMAGE_TAG:0:7}\`"
+            echo "Argo CD should detect the Git change and reconcile the application."
+          } >> "$GITHUB_STEP_SUMMARY"
