@@ -244,9 +244,6 @@ jobs:
       needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: write
-      id-token: write
     env:
       REGISTRY: ${{ needs.aws.outputs.registry }}
       SERVICES: frontend gateway auth-service catalog-service cart-service order-service payment-service
