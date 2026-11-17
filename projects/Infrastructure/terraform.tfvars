@@ -39,10 +39,11 @@ repositories = [
 cluster_admin_arns = [
   "arn:aws:iam::049986642697:user/Jaya-IAM",
 ]
+github_actions_role_name = "GitHubActions-ECR-Deploy-Role"
 
 # ---- GitOps -------------------------------------------------------------------
 # EDIT for your fork: Argo CD deploys gitops/ from this repository + branch.
-gitops_repo_url = "https://github.com/YOUR-GITHUB-USER/YOUR-REPO.git"
+gitops_repo_url = ""https://github.com/devopsvibez/AWSAIOpsProject.git""
 gitops_revision = "main"
 
 # ---- DNS (optional) -----------------------------------------------------------
